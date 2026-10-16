@@ -1,0 +1,259 @@
+!pip install optuna
+!pip install langgraph langchain langchain-anthropic captum grad-cam scipy
+!pip install pytorch-ood
+!pip install -u datasets
+!pip install -U langchain-openai
+!pip install -U langchain langgraph langchain-text-splitters langchain-community python-dotenv
+!pip install langchain-experimental
+!pip install langchain-neo4j
+
+import operator
+import re
+from typing import Annotated, TypedDict
+
+from dotenv import load_dotenv
+from langchain.chat_models import init_chat_model
+from langchain_neo4j import Neo4jGraph
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Send
+
+load_dotenv()
+
+MAX_HYPOTHESES = 4
+ELEMENT_ID = re.compile(r"\d+:[0-9a-f\-]+:\d+")
+
+llm = init_chat_model("gpt-5-nano")
+graph_db = Neo4jGraph(refresh_schema=False)
+
+
+def retrieve(terms: list[str], exclude_source: str | None = None, k: int = 10):
+    """Passages for entities matching any search term, with provenance.
+
+    Returns (formatted evidence text, set of retrieved chunk ids).
+    Chunks from `exclude_source` (the case's own paper) are never returned, and facts are only
+    taken between entities extracted from the same returned chunk, so they can't leak from it.
+    """
+    rows = graph_db.query(
+        """
+        UNWIND $terms AS term
+        MATCH (e:__Entity__) WHERE toLower(e.name) CONTAINS toLower(term)
+        WITH DISTINCT e
+        MATCH (e)-[:FROM_CHUNK]->(c:Chunk)-[:FROM_DOCUMENT]->(d:Document)
+        WHERE $exclude IS NULL OR d.path <> $exclude
+        OPTIONAL MATCH (e)-[r]->(n:__Entity__)-[:FROM_CHUNK]->(c)
+        WITH c, d, count(DISTINCT e) AS hits,
+             collect(DISTINCT e.name + ' ' + type(r) + ' ' + n.name)[..5] AS facts
+        ORDER BY hits DESC LIMIT $k
+        RETURN elementId(c) AS id, d.path AS source, left(c.text, 600) AS text, facts
+        """,
+        {"terms": terms, "exclude": exclude_source, "k": k},
+    )
+    text = "\n\n".join(
+        f"[{r['id']}] (source: {r['source']})\nFacts: {r['facts']}\n{r['text']}" for r in rows
+    ) or "No matching evidence in the knowledge graph."
+    return text, {r["id"] for r in rows}
+
+
+def unverified(text: str, retrieved: set[str]) -> list[str]:
+    """Evidence ids cited in `text` that were never actually retrieved."""
+    return sorted(set(ELEMENT_ID.findall(text)) - retrieved)
+
+
+class State(TypedDict, total=False):
+    case: str
+    rounds: int
+    exclude_source: str | None                           # case's own paper, hidden from retrieval
+    round: int
+    hypotheses: list[str]
+    arguments: Annotated[list[str], operator.add]        # parallel nodes append here
+    critiques: Annotated[list[str], operator.add]
+    hypothesis_log: Annotated[list[str], operator.add]   # how the differential evolved
+    withdrawn: Annotated[list[str], operator.add]        # diagnoses advocates gave up on
+    retrieved_ids: Annotated[list[str], operator.add]    # every chunk id any advocate saw
+    verdict: str
+
+
+def ask(prompt: str) -> str:
+    return llm.invoke(prompt).content
+
+
+def as_lines(text: str) -> list[str]:
+    """Split a model's one-item-per-line answer, stripping bullets and numbering."""
+    return [line.strip(" -•*0123456789.") for line in text.splitlines() if line.strip()]
+
+
+def propose(state: State) -> dict:
+    text = ask(f"List {MAX_HYPOTHESES} differential diagnoses for this neurology case, one per "
+               f"line, names only.\n\n{state['case']}")
+    hypotheses = as_lines(text)[:MAX_HYPOTHESES]
+    return {"hypotheses": hypotheses, "round": 1,
+            "hypothesis_log": [f"Round 1: {', '.join(hypotheses)}"]}
+
+
+def advocate(task: dict) -> dict:
+    """Plan fresh graph searches, argue for one diagnosis against rivals, then revise if warranted."""
+    dx = task["diagnosis"]
+
+    # Fresh retrieval each round, aimed at whatever the critics and rivals challenged.
+    terms = ask(
+        f"You will argue for the diagnosis: {dx}. List up to 5 short terms to search a neurology "
+        f"knowledge graph for (diseases, signs, tests, antibodies, anatomy) that would best test "
+        f"this diagnosis against the critiques and rival arguments. Comma-separated, nothing "
+        f"else.\n\nCASE:\n{task['case']}\n\nCRITIQUES:\n{task['critiques'] or 'None yet.'}\n\n"
+        f"RIVAL ARGUMENTS:\n{task['rivals'] or 'None yet.'}"
+    )
+    terms = [t.strip() for t in terms.split(",") if t.strip()][:5] + [dx]
+    evidence, retrieved = retrieve(terms, task["exclude_source"])
+
+    argument = ask(
+        f"You are the advocate for: {dx}. Argue it is the best diagnosis for the case. Directly "
+        f"rebut the strongest points in the rival arguments (if your own earlier argument appears "
+        f"there under an older name, build on it), answer the critiques, and admit findings that "
+        f"don't fit. Cite evidence by its [id] and use ONLY the evidence below.\n"
+        f"End with exactly ONE of these lines:\n"
+        f"  'REVISED: <diagnosis>' - the diagnosis you now defend (the same, more specific, or "
+        f"different)\n"
+        f"  'WITHDRAW: <reason citing evidence [ids] or case findings>' - only if the evidence "
+        f"STRONGLY shows your diagnosis is not viable (e.g. a defining feature is absent or "
+        f"contradicted). Weak or missing support is not enough; argue the case instead.\n\n"
+        f"CASE:\n{task['case']}\n\nCRITIQUES:\n{task['critiques'] or 'None yet.'}\n\n"
+        f"RIVAL ARGUMENTS:\n{task['rivals'] or 'None yet.'}\n\nEVIDENCE:\n{evidence}"
+    )
+
+    # Citation check in code: flag any cited id this advocate never retrieved.
+    bad = unverified(argument, retrieved)
+    flag = f"\nUNVERIFIED CITATIONS (not in retrieved evidence): {bad}" if bad else ""
+    update = {
+        "arguments": [f"ROUND {task['round']} | {dx}\nSearched: {terms}\n{argument}{flag}"],
+        "retrieved_ids": sorted(retrieved),
+    }
+
+    # A withdrawal is handled in code, so the diagnosis is removed for the rest of the debate.
+    withdraw = [l for l in argument.splitlines() if l.strip().upper().startswith("WITHDRAW:")]
+    if withdraw:
+        reason = withdraw[-1].split(":", 1)[1].strip()
+        update["withdrawn"] = [dx]
+        update["hypothesis_log"] = [f"Round {task['round']}: {dx} WITHDRAWN - {reason}"]
+    return update
+
+
+CRITICS = {
+    "evidence critic": "Check every claim against its cited evidence. Flag uncited claims, "
+                       "misread sources, over-generalisation from single case reports, and "
+                       "penalise any UNVERIFIED CITATIONS heavily.",
+    "clinical critic": "Ignore the literature. Judge fit with the case: localisation, time "
+                       "course, red flags, unexplained findings. End with one line "
+                       "'MISSING: <diagnosis>' naming the most important diagnosis nobody is "
+                       "defending, or 'MISSING: none'.",
+}
+
+
+def critic(task: dict) -> dict:
+    """Each critic works alone: it sees only this round's arguments, never other critiques."""
+    review = ask(f"You are the {task['name']}. {CRITICS[task['name']]}\nScore each diagnosis "
+                 f"0-10 with one-line reasons.\n\nCASE:\n{task['case']}\n\n"
+                 f"ARGUMENTS:\n{task['arguments']}")
+    return {"critiques": [f"ROUND {task['round']} | {task['name']}\n{review}"]}
+
+
+def moderate(state: State) -> dict:
+    """Between rounds: revise, add and drop hypotheses by explicit rules."""
+    rnd = state["round"]
+    if rnd >= state["rounds"]:          # last round done; the judge takes it from here
+        return {"round": rnd + 1}
+
+    withdrawn = [w.lower() for w in state.get("withdrawn", [])]
+    text = ask(
+        f"You moderate a diagnostic debate. Produce the hypothesis list for the next round by "
+        f"applying these rules in order:\n"
+        f"1. Replace each diagnosis with its advocate's REVISED diagnosis.\n"
+        f"2. Remove any diagnosis that BOTH critics scored 3 or below.\n"
+        f"3. Add the clinical critic's MISSING diagnosis if it is not 'none' and not already covered.\n"
+        f"4. Merge duplicates. Keep at most {MAX_HYPOTHESES}, strongest first.\n"
+        f"Never include a withdrawn diagnosis: {', '.join(withdrawn) or 'none'}.\n"
+        f"Answer with one diagnosis per line, names only.\n\n"
+        f"ARGUMENTS:\n{this_round(state['arguments'], rnd)}\n\n"
+        f"CRITIQUES:\n{this_round(state['critiques'], rnd)}"
+    )
+    # Enforce withdrawals in code too, in case the moderator lets one back in.
+    hypotheses = [h for h in as_lines(text) if h.lower() not in withdrawn][:MAX_HYPOTHESES]
+    if not hypotheses:                  # every advocate withdrew: go straight to the judge
+        return {"hypotheses": [], "round": state["rounds"] + 1,
+                "hypothesis_log": [f"Round {rnd + 1}: no viable hypotheses left"]}
+    return {"hypotheses": hypotheses, "round": rnd + 1,
+            "hypothesis_log": [f"Round {rnd + 1}: {', '.join(hypotheses)}"]}
+
+
+def judge(state: State) -> dict:
+    verdict = ask(
+        "Chair the case conference. Give a ranked differential with confidence levels, the "
+        "evidence [ids] behind each, how the differential evolved and why, the tests that would "
+        "best discriminate the top candidates, and any unresolved disagreement. Disregard any "
+        "claim resting on UNVERIFIED CITATIONS.\n\n"
+        f"CASE:\n{state['case']}\n\nHYPOTHESIS HISTORY:\n" + "\n".join(state["hypothesis_log"])
+        + "\n\nDEBATE:\n" + "\n\n".join(state["arguments"] + state["critiques"])
+    )
+    # The judge's citations must also come from evidence some advocate actually retrieved.
+    bad = unverified(verdict, set(state.get("retrieved_ids", [])))
+    if bad:
+        verdict += f"\n\nWARNING - cited ids never retrieved in this debate: {bad}"
+    return {"verdict": verdict}
+
+
+def this_round(items: list[str], rnd: int) -> str:
+    return "\n\n".join(i for i in items if i.startswith(f"ROUND {rnd} |"))
+
+
+def to_advocates(state: State):
+    if state["round"] > state["rounds"]:
+        return "judge"
+    prev = state["round"] - 1
+    last_critiques = this_round(state.get("critiques", []), prev)
+    last_args = [a for a in state.get("arguments", []) if a.startswith(f"ROUND {prev} |")]
+    return [Send("advocate", {
+        "diagnosis": dx, "case": state["case"], "round": state["round"],
+        "exclude_source": state.get("exclude_source"),
+        "critiques": last_critiques,
+        # Every previous-round argument except this advocate's own (matched by current name).
+        "rivals": "\n\n".join(a for a in last_args if not a.startswith(f"ROUND {prev} | {dx}\n")),
+    }) for dx in state["hypotheses"]]
+
+
+def to_critics(state: State):
+    args = this_round(state["arguments"], state["round"])
+    return [Send("critic", {"name": name, "case": state["case"], "round": state["round"],
+                            "arguments": args})
+            for name in CRITICS]
+
+
+builder = StateGraph(State)
+builder.add_node("propose", propose)
+builder.add_node("advocate", advocate)
+builder.add_node("gather", lambda state: {})   # waits for all advocates before critics start
+builder.add_node("critic", critic)
+builder.add_node("moderate", moderate)
+builder.add_node("judge", judge)
+
+builder.add_edge(START, "propose")
+builder.add_conditional_edges("propose", to_advocates, ["advocate", "judge"])
+builder.add_edge("advocate", "gather")
+builder.add_conditional_edges("gather", to_critics, ["critic"])
+builder.add_edge("critic", "moderate")
+builder.add_conditional_edges("moderate", to_advocates, ["advocate", "judge"])
+builder.add_edge("judge", END)
+app = builder.compile()
+
+from IPython.display import Image, display
+display(Image(app.get_graph().draw_mermaid_png()))
+
+live = app.invoke({
+    "case": "34-year-old woman, 3 days of painful right-eye vision loss worse on eye movement. "
+            "Right RAPD, reduced colour vision, normal fundi.",
+    "rounds": 1, "exclude_source": None})
+check("debate produced hypotheses and a verdict", bool(live["hypotheses"] and live["verdict"]))
+check("one argument per advocate", len(live["arguments"]) == len(live["hypotheses"]))
+check("one review per critic", len(live["critiques"]) == len(CRITICS))
+check("advocates retrieved evidence", bool(live["retrieved_ids"]))
+print("\nAll live checks passed.\n")
+print("\n".join(live["hypothesis_log"]), "\n")
+print(live["verdict"])
